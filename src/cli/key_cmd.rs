@@ -118,9 +118,9 @@ pub fn cmd_key_list(json: bool, show_secrets: bool) -> Result<()> {
                 );
             }
             println!(
-                "补齐：{}\n\
-                 等待期间在微信中打开相关聊天。",
-                config::RECOMMENDED_KEY_EXTRACT
+                "补齐：{}\n{}。",
+                config::RECOMMENDED_KEY_EXTRACT,
+                config::COLD_SHARD_ADVICE
             );
         } else if !missing.is_empty() {
             println!("\n✓ 关键聊天分片密钥齐全");
@@ -194,8 +194,14 @@ pub fn cmd_key_set(db_name: &str, enc_key: &str) -> Result<()> {
 }
 
 pub fn cmd_key_extract(hook_seconds: Option<u64>) -> Result<()> {
+    #[cfg(not(windows))]
     println!(
         "提取密钥（内存扫描 + 可选 LLDB hook；推荐：{}）…",
+        config::RECOMMENDED_KEY_EXTRACT
+    );
+    #[cfg(windows)]
+    println!(
+        "提取密钥（扫描微信进程内存：WCDB Config.Cipher / raw key；推荐：{}）…",
         config::RECOMMENDED_KEY_EXTRACT
     );
     #[cfg(unix)]

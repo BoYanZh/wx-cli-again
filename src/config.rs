@@ -2,18 +2,46 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-/// 产品统一推荐：补齐/重提数据库密钥（含冷分片 hook）。
+/// 产品统一推荐：补齐/重提数据库密钥。
+///
 /// 所有用户可见错误/警告应指向此命令，避免 `init --force` 与 `key extract` 分叉。
+/// macOS/Linux 上用 `--hook-seconds` 等待 LLDB hook 捕获冷分片；Windows 没有
+/// LLDB hook（`--hook-seconds` 在该平台完全无效），只能靠扫描微信进程内存，
+/// 因此不再在提示里推荐这个参数。
+#[cfg(not(windows))]
 pub const RECOMMENDED_KEY_EXTRACT: &str = "sudo wx key extract --hook-seconds 90";
+#[cfg(windows)]
+pub const RECOMMENDED_KEY_EXTRACT: &str = "wx key extract";
 
 /// 带冷分片操作说明的完整提示（一行或多行均可嵌入）。
+#[cfg(not(windows))]
 pub const RECOMMENDED_KEY_EXTRACT_HINT: &str =
     "sudo wx key extract --hook-seconds 90（等待期间在微信中打开相关聊天以捕获冷分片密钥）";
+#[cfg(windows)]
+pub const RECOMMENDED_KEY_EXTRACT_HINT: &str =
+    "wx key extract（Windows 无 --hook-seconds：保持微信已登录、先在微信里打开目标聊天，再执行扫描）";
+
+/// 平台补充说明：Windows 下必须明确告知用户 hook 参数无效，避免他们照抄 macOS 的指令。
+/// （仅 Windows 定义；macOS/Linux 不需要这条提示。）
+#[cfg(windows)]
+pub const KEY_EXTRACT_PLATFORM_NOTE: &str =
+    "--hook-seconds 只在 macOS 生效（走 LLDB hook）；Windows 靠扫描微信进程内存中的 WCDB Config.Cipher/raw key 取钥，请先登录微信并在微信里打开过目标聊天，再运行扫描";
+
+/// 补冷分片（久未打开的 message_N.db）时的操作建议。
+///
+/// macOS/Linux 有 hook 等待期，可以"边等边点聊天"；Windows 没有等待期，
+/// 必须在扫描**之前**就让微信把目标会话加载进内存，否则扫不到。
+#[cfg(not(windows))]
+pub const COLD_SHARD_ADVICE: &str = "并在等待期间打开对应聊天以触发冷分片解密";
+#[cfg(windows)]
+pub const COLD_SHARD_ADVICE: &str =
+    "扫描前请先在微信里打开对应聊天（Windows 没有 hook 等待期，--hook-seconds 无效；密钥只在该会话被加载进内存后才能读到）";
 
 #[cfg(test)]
 mod recommended_cmd_tests {
     use super::*;
 
+    #[cfg(not(windows))]
     #[test]
     fn recommended_key_extract_is_key_cmd_with_hook() {
         assert!(RECOMMENDED_KEY_EXTRACT.starts_with("sudo wx key extract"));
@@ -22,6 +50,18 @@ mod recommended_cmd_tests {
         assert!(RECOMMENDED_KEY_EXTRACT_HINT.contains(RECOMMENDED_KEY_EXTRACT)
             || RECOMMENDED_KEY_EXTRACT_HINT.starts_with("sudo wx key extract"));
         assert!(!RECOMMENDED_KEY_EXTRACT_HINT.contains("init --force"));
+    }
+
+    /// Windows 没有 LLDB hook：提示里不能再出现 `--hook-seconds`，否则纯属误导。
+    #[cfg(windows)]
+    #[test]
+    fn recommended_key_extract_on_windows_does_not_suggest_hook() {
+        assert_eq!(RECOMMENDED_KEY_EXTRACT, "wx key extract");
+        assert!(!RECOMMENDED_KEY_EXTRACT.contains("--hook-seconds"));
+        assert!(!RECOMMENDED_KEY_EXTRACT_HINT.contains("--hook-seconds 90"));
+        assert!(RECOMMENDED_KEY_EXTRACT_HINT.contains("wx key extract"));
+        assert!(RECOMMENDED_KEY_EXTRACT_HINT.contains("打开目标聊天"));
+        assert!(KEY_EXTRACT_PLATFORM_NOTE.contains("只在 macOS 生效"));
     }
 }
 

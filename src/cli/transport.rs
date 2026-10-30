@@ -7,9 +7,23 @@ use std::time::Duration;
 use crate::config;
 use crate::ipc::{Request, Response};
 
+#[cfg(unix)]
 const STARTUP_TIMEOUT_SECS: u64 = 15;
 #[cfg(unix)]
 const STOP_TIMEOUT_MS: u64 = 2_000;
+
+/// Windows 单次请求的响应等待上限（与 Unix 的 120s 读超时对齐）。
+#[cfg(windows)]
+const WINDOWS_IO_TIMEOUT_SECS: u64 = 120;
+/// Windows ping 的超时：只用于判断 daemon 是否就绪，不需要等太久。
+#[cfg(windows)]
+const WINDOWS_PING_TIMEOUT_SECS: u64 = 3;
+/// Windows 启动 daemon 的总等待上限。
+///
+/// 不能沿用 Unix 的 15s：daemon 首次启动要预热（全量解密 contact/session/sns），
+/// 本机实测 15-40s，慢盘更久；15s 就报"启动超时"是误报。
+#[cfg(windows)]
+const WINDOWS_WARMUP_TIMEOUT_SECS: u64 = 300;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PidFile {
@@ -176,12 +190,23 @@ fn start_daemon() -> Result<()> {
         child_pid = child.id();
     }
 
-    // 等待 daemon 就绪（最多 STARTUP_TIMEOUT_SECS 秒）
+    // 等待 daemon 就绪
+    #[cfg(unix)]
+    wait_daemon_ready(child_pid, &exe)?;
+    #[cfg(windows)]
+    wait_daemon_ready_windows(child_pid, &exe)?;
+
+    Ok(())
+}
+
+/// Unix：等待 daemon 建好 socket（最多 STARTUP_TIMEOUT_SECS 秒），行为与旧版一致。
+#[cfg(unix)]
+fn wait_daemon_ready(child_pid: u32, exe: &Path) -> Result<()> {
     let deadline = std::time::Instant::now() + Duration::from_secs(STARTUP_TIMEOUT_SECS);
     while std::time::Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(300));
         if is_alive() {
-            write_pid_file(child_pid, &exe)?;
+            write_pid_file(child_pid, exe)?;
             return Ok(());
         }
     }
@@ -191,6 +216,76 @@ fn start_daemon() -> Result<()> {
         STARTUP_TIMEOUT_SECS,
         config::log_path().display()
     )
+}
+
+/// Windows：等待 daemon 建好 named pipe 并完成首次预热。
+///
+/// daemon 只有在预热（全量解密 contact/session/sns）结束后才开始监听 pipe，
+/// 所以这段时间 ping 一定失败。这里把它当作正常进度打印出来，而不是 15s
+/// 就误报"启动超时"；同时把 daemon.log 最后一行带出来，卡住时能立刻看出是
+/// 预热慢还是已经报错退出。
+#[cfg(windows)]
+fn wait_daemon_ready_windows(child_pid: u32, exe: &Path) -> Result<()> {
+    let log_path = config::log_path();
+    let started = std::time::Instant::now();
+    let mut last_report = started;
+
+    eprintln!("等待 wx-daemon 就绪（首次启动需预热：全量解密 contact/session/sns，通常 15-60s）…");
+
+    loop {
+        std::thread::sleep(Duration::from_millis(300));
+        if is_alive() {
+            write_pid_file(child_pid, exe)?;
+            return Ok(());
+        }
+
+        let elapsed = started.elapsed();
+        if elapsed >= Duration::from_secs(WINDOWS_WARMUP_TIMEOUT_SECS) {
+            let tail = daemon_log_tail(&log_path)
+                .map(|line| format!("\n日志最后一行: {line}"))
+                .unwrap_or_default();
+            bail!(
+                "wx-daemon 仍未就绪（已等待 {}s，上限 {}s）{tail}\n\
+                 日志: {}\n\
+                 排查：\n  \
+                 1) 日志里最后是\"预热\"相关且还在推进 → 只是慢，稍后直接重试 `wx sessions`（daemon 就绪后会自动连上）；\n  \
+                 2) 日志尾是错误信息 → 按提示修复后 `wx daemon stop` 再重试；\n  \
+                 3) 日志没有任何新内容 → 确认 {} 进程没被杀、{} 可写。",
+                elapsed.as_secs(),
+                WINDOWS_WARMUP_TIMEOUT_SECS,
+                log_path.display(),
+                exe.display(),
+                config::cli_dir().display()
+            );
+        }
+
+        // 每 5s 报一次进度，避免用户以为 CLI 卡死
+        if last_report.elapsed() >= Duration::from_secs(5) {
+            last_report = std::time::Instant::now();
+            let tail = daemon_log_tail(&log_path)
+                .map(|line| format!("｜{line}"))
+                .unwrap_or_default();
+            eprintln!("  … 预热中（已 {}s）{tail}", elapsed.as_secs());
+        }
+    }
+}
+
+/// 读 daemon.log 的最后一条非空行（只看末尾 8KB，避免整文件读入）。
+#[cfg(windows)]
+fn daemon_log_tail(path: &Path) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    file.seek(SeekFrom::Start(len.saturating_sub(8 * 1024))).ok()?;
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf).ok()?;
+    let text = String::from_utf8_lossy(&buf);
+    text.lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(|line| line.to_string())
 }
 
 fn write_pid_file(pid: u32, exe: &Path) -> Result<()> {
@@ -264,11 +359,56 @@ fn ping_windows() -> Result<bool> {
     let req = serde_json::to_string(&Request::Ping)? + "\n";
     reader.get_mut().write_all(req.as_bytes())?;
 
-    let mut line = String::new();
-    reader.read_line(&mut line)?;
+    let line = read_line_with_timeout(
+        reader,
+        Duration::from_secs(WINDOWS_PING_TIMEOUT_SECS),
+        "ping",
+    )?;
 
     let resp: Response = serde_json::from_str(&line)?;
     Ok(resp.ok && resp.data.get("pong").and_then(|p| p.as_bool()) == Some(true))
+}
+
+/// 从 named pipe 读一行，带超时。
+///
+/// interprocess 的 Windows named pipe 不支持 I/O 超时
+/// （`set_recv_timeout` 直接返回 `ErrorKind::Unsupported`），所以只能用
+/// "读线程 + 超时等待"：超时后读线程可能仍阻塞在 ReadFile 上，但 CLI 进程
+/// 随即退出，泄漏一个线程不影响结果（比无限期卡死好得多）。
+#[cfg(windows)]
+fn read_line_with_timeout(
+    reader: BufReader<interprocess::local_socket::Stream>,
+    timeout: Duration,
+    what: &str,
+) -> Result<String> {
+    use std::sync::mpsc::{sync_channel, RecvTimeoutError};
+
+    let (tx, rx) = sync_channel(1);
+    std::thread::spawn(move || {
+        let mut reader = reader;
+        let mut line = String::new();
+        let result = reader.read_line(&mut line).map(|_| line);
+        let _ = tx.send(result);
+    });
+
+    match rx.recv_timeout(timeout) {
+        Ok(Ok(line)) => Ok(line),
+        Ok(Err(err)) => Err(err).with_context(|| format!("读取 daemon {what} 响应失败")),
+        Err(RecvTimeoutError::Timeout) => bail!(
+            "等待 daemon {what} 响应超时（>{timeout}s）\n\
+             最可能是 daemon 仍在首次预热（全量解密 contact/session/sns，通常 15-60s），也可能是 daemon 卡住了。\n\
+             排查：\n  \
+             1) 看日志尾部: {}（出现\"预热完成\"或\"监听\"后重试即可）；\n  \
+             2) 日志尾是报错 → 修复后 `wx daemon stop` 再重试；\n  \
+             3) 日志没有新内容 → daemon 可能已卡死，`wx daemon stop` 后重试。",
+            config::log_path().display(),
+            timeout = timeout.as_secs()
+        ),
+        Err(RecvTimeoutError::Disconnected) => bail!(
+            "daemon 连接已断开（{what} 读线程异常退出）\n请查看日志: {}",
+            config::log_path().display()
+        ),
+    }
 }
 
 fn pid_belongs_to_daemon(pid_file: &PidFile) -> Result<bool> {
@@ -477,10 +617,26 @@ fn send_windows(req: Request) -> Result<Response> {
     let mut reader = BufReader::new(stream);
 
     let req_str = serde_json::to_string(&req)? + "\n";
-    reader.get_mut().write_all(req_str.as_bytes())?;
+    reader
+        .get_mut()
+        .write_all(req_str.as_bytes())
+        .context("向 daemon 发送请求失败")?;
+    let _ = reader.get_mut().flush();
 
-    let mut line = String::new();
-    reader.read_line(&mut line)?;
+    // 与 Unix 的 120s 读超时对等（named pipe 不支持原生 I/O 超时，见
+    // `read_line_with_timeout`）。
+    let line = read_line_with_timeout(
+        reader,
+        Duration::from_secs(WINDOWS_IO_TIMEOUT_SECS),
+        "请求",
+    )?;
+
+    if line.trim().is_empty() {
+        bail!(
+            "daemon 关闭了连接、未返回任何响应\n请查看日志: {}",
+            config::log_path().display()
+        );
+    }
 
     let resp: Response = serde_json::from_str(&line).context("解析 daemon 响应失败")?;
 

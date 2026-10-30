@@ -59,8 +59,8 @@ enum Commands {
         /// 强制重新扫描（与已有有效密钥合并，不会因部分失败而清空）
         #[arg(long)]
         force: bool,
-        /// macOS: LLDB hook 等待秒数（0=禁用）。内存扫描配不齐冷分片时，
-        /// 在等待期间打开微信会话可捕获 per-DB AES key。
+        /// macOS 专用：LLDB hook 等待秒数（0=禁用；Windows/Linux 忽略）。
+        /// 内存扫描配不齐冷分片时，在等待期间打开微信会话可捕获 per-DB AES key。
         #[arg(long)]
         hook_seconds: Option<u64>,
     },

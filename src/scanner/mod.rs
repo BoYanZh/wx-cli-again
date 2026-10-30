@@ -62,7 +62,14 @@ pub fn scan_keys_with_options(db_dir: &Path, opts: ScanOptions<'_>) -> Result<Ve
     }
     #[cfg(target_os = "windows")]
     {
-        let _ = opts;
+        // Windows 没有 LLDB hook：`--hook-seconds` 在这里没有任何作用。
+        // 显式传了就明确告知（而不是让用户以为"多等 90s 就能补齐冷分片"）。
+        if opts.hook_seconds > 0 {
+            eprintln!(
+                "[wx] 提示：--hook-seconds 在 Windows 无效（只有 macOS 的 LLDB hook 支持该参数），已忽略；\
+                 Windows 靠扫描微信进程内存取钥，请确认微信已登录、并先在微信里打开过目标聊天。"
+            );
+        }
         return windows::scan_keys(db_dir);
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]

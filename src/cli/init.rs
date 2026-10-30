@@ -37,7 +37,7 @@ pub fn cmd_init(force: bool, hook_seconds: Option<u64>) -> Result<()> {
                                 .collect();
                             println!(
                                 "[wx] 警告：磁盘上仍有 {} 个加密 DB 没有密钥（关键 {} 个，例如 {}）。\n\
-                                 运行 {} 重新提取，并在等待期间打开对应聊天以触发冷分片解密。",
+                                 运行 {} 重新提取，{}。",
                                 missing.len(),
                                 critical.len(),
                                 critical
@@ -46,7 +46,8 @@ pub fn cmd_init(force: bool, hook_seconds: Option<u64>) -> Result<()> {
                                     .or(missing.first())
                                     .map(|s| s.as_str())
                                     .unwrap_or(""),
-                                config::RECOMMENDED_KEY_EXTRACT
+                                config::RECOMMENDED_KEY_EXTRACT,
+                                config::COLD_SHARD_ADVICE
                             );
                         }
                     }
@@ -88,16 +89,21 @@ pub fn cmd_init(force: bool, hook_seconds: Option<u64>) -> Result<()> {
     let entries = scanner::merge_key_entries(&scanned, &existing_entries);
 
     if entries.is_empty() {
-        bail!(
+        let msg = format!(
             "没有任何候选 key 能解密所选数据目录中的数据库，已保留现有配置和 key 文件。\n\
              当前数据目录: {}\n\
              如果本机登录过多个微信账号，请确认该目录属于当前正在运行的账号；\
              退出其他账号并让当前账号产生一条新消息后，再运行：\n\
              {}\n\
-             冷分片（久未打开的 message_N.db）同一命令，等待期间滚动/打开对应会话。",
+             冷分片（久未打开的 message_N.db）用同一条命令，{}。",
             db_dir.display(),
-            config::RECOMMENDED_KEY_EXTRACT
+            config::RECOMMENDED_KEY_EXTRACT,
+            config::COLD_SHARD_ADVICE
         );
+        // Windows: 明确 hook 参数无效；macOS/Linux: 不加任何内容，保持原文案
+        #[cfg(windows)]
+        let msg = format!("{}\n{}", msg, config::KEY_EXTRACT_PLATFORM_NOTE);
+        bail!("{}", msg);
     }
 
     // === 权限边界 ===
@@ -159,9 +165,9 @@ pub fn cmd_init(force: bool, hook_seconds: Option<u64>) -> Result<()> {
         }
         if !critical.is_empty() {
             println!(
-                "补齐关键分片：{}\n\
-                 等待期间请在微信中打开相关聊天/滚动历史，触发冷分片加载。",
-                config::RECOMMENDED_KEY_EXTRACT
+                "补齐关键分片：{}\n{}。",
+                config::RECOMMENDED_KEY_EXTRACT,
+                config::COLD_SHARD_ADVICE
             );
         }
     }

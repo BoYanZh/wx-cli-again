@@ -53,10 +53,18 @@ pub fn cmd_doctor(json: bool, fix: bool) -> Result<()> {
         if all_ok {
             println!("\n全部检查通过。");
         } else {
+            #[cfg(not(windows))]
             println!(
                 "\n存在未通过项。补密钥：{}\n\
                  （本机 GUI Terminal + 等待时打开相关聊天；SIP 无需关闭）",
                 config::RECOMMENDED_KEY_EXTRACT
+            );
+            #[cfg(windows)]
+            println!(
+                "\n存在未通过项。补密钥：{}\n\
+                 （{}）",
+                config::RECOMMENDED_KEY_EXTRACT,
+                config::KEY_EXTRACT_PLATFORM_NOTE
             );
         }
     }
@@ -214,10 +222,9 @@ fn run_checks() -> Vec<Check> {
                     preview
                 ),
                 fix: Some(format!(
-                    "{}\n\
-                     等待期间在微信中打开对应聊天（触发冷分片加载）：\n\
-                     {}",
+                    "{}\n{}：\n{}",
                     config::RECOMMENDED_KEY_EXTRACT,
+                    config::COLD_SHARD_ADVICE,
                     critical
                         .iter()
                         .take(8)
@@ -279,18 +286,38 @@ fn run_checks() -> Vec<Check> {
         });
     }
 
-    // daemon sock
-    let sock = config::sock_path();
-    out.push(Check {
-        name: "daemon socket".into(),
-        ok: sock.exists(),
-        detail: if sock.exists() {
-            sock.display().to_string()
-        } else {
-            "未运行（首次查询会自动启动）".into()
-        },
-        fix: Some("wx sessions 或 wx daemon start".into()),
-    });
+    // daemon 状态
+    //
+    // Windows 没有 socket 文件（走 named pipe），判断"文件存在"必然永远是 ✗，
+    // 所以这里改成 ping 一次 pipe；Unix 保持原来的 socket 文件检查。
+    #[cfg(unix)]
+    {
+        let sock = config::sock_path();
+        out.push(Check {
+            name: "daemon socket".into(),
+            ok: sock.exists(),
+            detail: if sock.exists() {
+                sock.display().to_string()
+            } else {
+                "未运行（首次查询会自动启动）".into()
+            },
+            fix: Some("wx sessions 或 wx daemon start".into()),
+        });
+    }
+    #[cfg(windows)]
+    {
+        let alive = super::transport::is_alive();
+        out.push(Check {
+            name: "daemon named pipe".into(),
+            ok: alive,
+            detail: if alive {
+                "运行中（\\\\.\\pipe\\wx-cli-daemon）".into()
+            } else {
+                "未运行或仍在预热（首次查询会自动启动）".into()
+            },
+            fix: Some("wx sessions 或 wx daemon start".into()),
+        });
+    }
 
     out
 }
@@ -339,16 +366,39 @@ fn format_missing_preview(items: &[scanner::MissingDb], max: usize) -> String {
 }
 
 fn find_wechat_pid() -> Option<u32> {
-    let out = Command::new("pgrep").args(["-x", "WeChat"]).output().ok()?;
-    if !out.status.success() {
-        return None;
+    #[cfg(not(windows))]
+    {
+        let out = Command::new("pgrep").args(["-x", "WeChat"]).output().ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .next()?
+            .trim()
+            .parse()
+            .ok()
     }
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .next()?
-        .trim()
-        .parse()
-        .ok()
+    // Windows 没有 pgrep：用 tasklist 查 Weixin.exe（新版微信进程名）
+    #[cfg(windows)]
+    {
+        let out = Command::new("tasklist")
+            .args([
+                "/FI",
+                "IMAGENAME eq Weixin.exe",
+                "/FO",
+                "CSV",
+                "/NH",
+            ])
+            .output()
+            .ok()?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        text.lines().find_map(|line| {
+            let mut fields = line.trim().trim_matches('"').split("\",\"");
+            let _name = fields.next()?;
+            fields.next()?.parse::<u32>().ok()
+        })
+    }
 }
 
 fn read_key_for(keys_path: &Path, rel: &str) -> Option<String> {
